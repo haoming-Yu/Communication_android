@@ -1,0 +1,13 @@
+<launch>
+<!-- Launch file for Livox AVIA LiDAR -->
+
+	<arg name="rviz" default="true" />
+
+	<rosparam file="$(find pcd_receiver)/config/voxel_hashing.yaml" command="load" />
+    <node pkg="pcd_receiver" type="pcd_receiver" name="pcd_receiver" output="screen" />
+
+	<group if="$(arg rviz)">
+	<node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz" args="-d $(find pcd_receiver)/rviz_cfg/loam_livox.rviz" />
+	</group>
+
+</launch>
