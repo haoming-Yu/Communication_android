@@ -4,8 +4,7 @@ project(pcd_receiver)
 SET(CMAKE_BUILD_TYPE "Debug")
 
 ADD_COMPILE_OPTIONS(-std=c++14 )
-ADD_COMPILE_OPTIONS(-std=c++14 )
-set( CMAKE_CXX_FLAGS "-std=c++14 -O3" )
+set( CMAKE_CXX_FLAGS "-std=c++14 -O3 -Wall" )
 
 add_definitions(-DROOT_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/\")
 
@@ -65,6 +64,8 @@ set(PCL_INCLUDE_DIRS /usr/include/pcl-1.10)  # 根据你的PCL版本调整
 # 查找PCL包
 find_package(PCL 1.10 REQUIRED PATHS ${PCL_ROOT} NO_DEFAULT_PATH)
 
+find_package(OpenCV REQUIRED)
+
 # 添加PCL库的具体路径
 link_directories(${PCL_ROOT})
 
@@ -84,6 +85,7 @@ set(CUDA_NVCC_FLAGS
     -G                          # 只保留-G，移除-lineinfo
     --disable-warnings
     -Wno-deprecated-declarations
+    
 )
 
 # 添加编译选项来抑制特定警告
@@ -101,14 +103,13 @@ include_directories(
   ${PCL_INCLUDE_DIRS}
   ${PYTHON_INCLUDE_DIRS}
   ${CUDA_INCLUDE_DIRS}
+  ${OpenCV_INCLUDE_DIRS}
   include
   include/voxel_hashing)
 
 cuda_add_library(
   cuda_example 
   src/cuda_test.cu 
-  src/cuda_format.cu 
-  src/VoxelHash.cu
 )
 
 catkin_package(
@@ -123,6 +124,7 @@ target_link_libraries(pcd_receiver
     ${catkin_LIBRARIES} 
     ${PCL_LIBRARIES}
     ${PYTHON_LIBRARIES} 
+    ${OpenCV_LIBS}
     yaml-cpp
 )
 target_include_directories(pcd_receiver PRIVATE ${PYTHON_INCLUDE_DIRS})

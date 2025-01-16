@@ -1,224 +1,231 @@
 #include "pcd_receiver.hpp"
 #include "cuda_test.hpp"
-#include "cuda_format.hpp"
-#include "voxel_hashing/MarchingCubesSDFUtil.h"
-#include "voxel_hashing/CUDAMarchingCubesHashSDF.h"
-#include "VoxelHash.h"
-#include "CUDAMarchingCubesHashSDF.h"
-#include <pcl/features/normal_3d.h>
-#include <pcl/search/kdtree.h>
-#include <cuda_runtime.h>
-#include <pcl/point_types.h>
-#include <yaml-cpp/yaml.h>
-#include <termios.h>
-#include <unistd.h>
-#include <pthread.h>
-#include <cuda_runtime.h>
 
-typedef pcl::PointXYZINormal PointType;
-typedef pcl::PointCloud<PointType> PointCloudXYZI;
+// lidar to imu
+std::vector<double> extrinT(3, 0.0);
+std::vector<double> extrinR(9, 0.0);
 
-#define MAX_POINT_CLOUD_ITER 1200
-#define MAX_VOXELS 200000 * 500
+// camera to lidar
+std::vector<double> cameraextrinT(3, 0.0); 
+std::vector<double> cameraextrinR(9, 0.0);
 
-HashData *d_hashdata;
+typedef Eigen::Vector3d V3D;
+typedef Eigen::Vector2d V2D;
+typedef Eigen::Matrix3d M3D;
+typedef Eigen::Vector3f V3F;
+typedef Eigen::Matrix3f M3F;
 
-int count_refresh = 0;
+#define MD(a,b)  Eigen::Matrix<double, (a), (b)>
+#define VD(a)    Eigen::Matrix<double, (a), 1>
+#define MF(a,b)  Eigen::Matrix<float, (a), (b)>
+#define VF(a)    Eigen::Matrix<float, (a), 1>
 
-extern "C" void resetMarchingCubesCUDA(MarchingCubesData& data);
-extern "C" void extractIsoSurfaceCUDA(const HashData& hashData, const MarchingCubesParams& params, MarchingCubesData& data);
-extern "C" void extractIsoSurfacePass1CUDA(const HashData& hashData, const MarchingCubesParams& params, MarchingCubesData& data);
-extern "C" void extractIsoSurfacePass2CUDA(const HashData& hashData, const MarchingCubesParams& params, MarchingCubesData& data, unsigned int numOccupiedBlocks);
+#define VEC_FROM_ARRAY(v)        v[0],v[1],v[2]
+#define MAT_FROM_ARRAY(v)        v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8]
 
-#define cudaCheckError(err) if (err != cudaSuccess) { printf("CUDA error: %s, line: %d, file: %s\n", cudaGetErrorString(err), __LINE__, __FILE__); }
+M3D Eye3d(M3D::Identity());
+M3F Eye3f(M3F::Identity());
+V3D Zero3d(0, 0, 0);
+V3F Zero3f(0, 0, 0);
 
-void CUDAMarchingCubesHashSDF::create(const MarchingCubesParams& params)
-{ 
-	m_params = params;
-	m_data.allocate(m_params);
+V3D Lidar_offset_to_IMU(Zero3d);
+M3D Lidar_rot_to_IMU(Eye3d);
 
-	resetMarchingCubesCUDA(m_data);
+V3D Camera_offset_to_Lidar(Zero3d);
+M3D Camera_rot_to_Lidar(Eye3d);
+
+M3D state_rot(Eye3d);
+V3D state_pos(Zero3d);
+
+M3D state_cam_rot(Eye3d);
+V3D state_cam_pos(Zero3d);
+M3F state_cam_rot_f(Eye3f);
+
+int img_cnt = 0;
+int lidar_cnt = 0;
+int odom_cnt = 0;
+int path_cnt = 0;
+
+
+void readParameters(ros::NodeHandle &nh)
+{
+    nh.param<std::vector<double>>("mapping/extrinsic_T", extrinT, std::vector<double>());
+    nh.param<std::vector<double>>("mapping/extrinsic_R", extrinR, std::vector<double>());
+    nh.param<std::vector<double>>("camera/Pcl", cameraextrinT, std::vector<double>());
+    nh.param<std::vector<double>>("camera/Rcl", cameraextrinR, std::vector<double>());
 }
 
-void CUDAMarchingCubesHashSDF::destroy(void)
+void pointWorldToLidar(PointType const * const pi, PointType * const po)
 {
-	m_data.free();
+    V3D p_world(pi->x, pi->y, pi->z);
+    
+    V3D p_lidar = Lidar_rot_to_IMU.inverse() * (state_rot.inverse() * (p_world - state_pos) - Lidar_offset_to_IMU);
+
+    po->x = p_lidar(0);
+    po->y = p_lidar(1);
+    po->z = p_lidar(2);
+    po->r = pi->r;
+    po->g = pi->g;
+    po->b = pi->b; 
+    po->a = pi->a;
 }
 
-void CUDAMarchingCubesHashSDF::extractIsoSurface(const HashData& hashData, const vec3f& minCorner, const vec3f& maxCorner, bool boxEnabled)
+void pointWorldToCamera(PointType const * const pi, PointType * const po)
 {
-	resetMarchingCubesCUDA(m_data);
-	float3 maxc = {maxCorner.x,maxCorner.y,maxCorner.z};
-	float3 minc = {minCorner.x,minCorner.y,minCorner.z};
-	m_params.m_maxCorner = maxc;
-	m_params.m_minCorner = minc;
-	m_params.m_boxEnabled = boxEnabled;
-	m_data.updateParams(m_params);
+    V3D p_world(pi->x, pi->y, pi->z);
+    
+    V3D p_cam = Camera_rot_to_Lidar.inverse() * (Lidar_rot_to_IMU.inverse() * (state_rot.inverse() * (p_world - state_pos) - Lidar_offset_to_IMU) - Camera_offset_to_Lidar);
 
-    // get the number of occupied blocks, and save the bucket id of the occupied blocks to pass to pass 2
-	extractIsoSurfacePass1CUDA(hashData, m_params, m_data);
-    cudaCheckError(cudaGetLastError());
-    ROS_INFO("extractIsoSurfacePass1CUDA completed");
-    // to extract the triangles, we need to traverse the occupied blocks, and do the marching cubes on each voxel in the occupied blocks.
-	extractIsoSurfacePass2CUDA(hashData, m_params, m_data, m_data.getNumOccupiedBlocks());
-    cudaCheckError(cudaGetLastError());
-    ROS_INFO("extractIsoSurfacePass2CUDA completed");
-    // printf("In CUDAMarchingCubesHashSDF::extractIsoSurface, after extractIsoSurfacePass2CUDA\n");
+    po->x = p_cam(0);
+    po->y = p_cam(1);
+    po->z = p_cam(2);
+    po->r = pi->r;
+    po->g = pi->g;
+    po->b = pi->b; 
+    po->a = pi->a;
 }
 
-void CUDAMarchingCubesHashSDF::export_ply(const std::string& filename)
+void BodyToCamera(V3D& imu_trans, M3D& imu_rot)
 {
-    MarchingCubesData cpuData = m_data.copyToCPU();
-    std::ofstream file_out { filename };
-    if (!file_out.is_open())
-        return;
-    file_out << "ply" << std::endl;
-    file_out << "format ascii 1.0" << std::endl;
-    file_out << "element vertex " << 3*cpuData.d_numTriangles[0] << std::endl;
-    file_out << "property float x" << std::endl;
-    file_out << "property float y" << std::endl;
-    file_out << "property float z" << std::endl;
-    file_out << "element face " << cpuData.d_numTriangles[0] << std::endl;
-    file_out << "property list uchar int vertex_index" << std::endl;
-    file_out << "end_header" << std::endl;
+    state_cam_pos = Camera_rot_to_Lidar * (Lidar_rot_to_IMU * imu_trans + Lidar_offset_to_IMU) + Camera_offset_to_Lidar;
+    state_cam_rot = Camera_rot_to_Lidar * Lidar_rot_to_IMU * imu_rot;
+    state_cam_rot_f = state_cam_rot.cast<float>();
+}
 
-    for (int v_idx = 0; v_idx < cpuData.d_numTriangles[0]; ++v_idx) {
-        float3 v0 = cpuData.d_triangles[v_idx].v0.p;
-        float3 v1 = cpuData.d_triangles[v_idx].v1.p;
-        float3 v2 = cpuData.d_triangles[v_idx].v2.p;
-        file_out << v0.x << " " << v0.y << " " << v0.z << " ";
-        file_out << v1.x << " " << v1.y << " " << v1.z << " ";
-        file_out << v2.x << " " << v2.y << " " << v2.z << " ";
+cv::Mat processDepthImage(cv::Mat depth_image)
+{
+    // Normalize and apply color map for visualization
+    double min, max;
+    cv::minMaxIdx(depth_image, &min, &max);
+    cv::Mat adjMap;
+    cv::convertScaleAbs(depth_image, adjMap, 255 / max);
+    cv::Mat falseColorsMap;
+    cv::applyColorMap(adjMap, falseColorsMap, cv::COLORMAP_JET);
+
+    // Apply bilateral filter
+    cv::Mat filtered_image;
+    cv::bilateralFilter(falseColorsMap, filtered_image, 9, 75, 75);
+
+    return filtered_image;
+}
+
+int name_cnt = 0;
+cv::Mat transformPointCloudToDepthImage(PointCloudXYZRGB::Ptr cloud)
+{
+    // transform point cloud to depth image
+    Eigen::Affine3f sensorPose;
+    int width = 640, height = 480;
+    float fx = 525, fy = 525, cx = 320, cy = 240;  
+
+    // set sensorPose to odometry
+    BodyToCamera(state_pos, state_rot);
+    sensorPose.translation() << state_cam_pos(0), state_cam_pos(1), state_cam_pos(2);
+    sensorPose.rotate(state_cam_rot_f);
+    pcl::RangeImagePlanar::CoordinateFrame coordinate_frame = pcl::RangeImage::CAMERA_FRAME;
+    pcl::RangeImagePlanar::Ptr rangeImage(new pcl::RangeImagePlanar);
+    rangeImage->createFromPointCloudWithFixedSize(*cloud, width, height, cx, cy, fx, fy, sensorPose, coordinate_frame);
+
+    cv::Mat depth_image(height, width, CV_32FC1);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            float range = rangeImage->getPoint(x, y).range;
+            depth_image.at<float>(y, x) = range;
+        }
     }
 
-    for (int t_idx = 0; t_idx < 3*cpuData.d_numTriangles[0]; t_idx += 3) {
-        file_out << 3 << " " << t_idx + 1 << " " << t_idx << " " << t_idx + 2 << std::endl;
-    }
+    // Save depth image to file
+    cv::imwrite("/home/hmy/catkin_ws/src/pcd_receiver/PCD/depth_img/depth_img_" + std::to_string(name_cnt) + ".png", processDepthImage(depth_image));
+    name_cnt++;
+
+    return depth_image;
 }
 
 void PointCloudSubscriber::pointCloudCallback(const sensor_msgs::PointCloud2ConstPtr& msg)
 {
-    PointCloudXYZI::Ptr tmp(new PointCloudXYZI(msg->width * msg->height, 1));
+    PointCloudXYZRGB::Ptr tmp(new PointCloudXYZRGB(msg->width * msg->height, 1));
     this->received_cloud_ = tmp;
     pcl::fromROSMsg(*msg, *(this->received_cloud_));
-
+    lidar_cnt++;
     ROS_INFO("Received PointCloud message with %ld points", this->received_cloud_->size());
+}
 
-    // upload point cloud data to GPU
-    PointType* d_pointCloudData = nullptr;
-    size_t numPoints = this->received_cloud_->points.size();
-    size_t dataSize = numPoints * sizeof(PointType);
+void ImageSubscriber::imageCallback(const sensor_msgs::ImageConstPtr& msg)
+{
+    this->received_image_ = cv::Mat(msg->height, msg->width, CV_8UC3, const_cast<uchar*>(msg->data.data()));
+    img_cnt++;
 
-    cudaCheck(cudaMalloc((void**)&d_pointCloudData, dataSize));
-    // calculate normals
-    pcl::NormalEstimation<PointType, pcl::Normal> ne;
-    ne.setInputCloud(this->received_cloud_);
-    pcl::search::KdTree<PointType>::Ptr tree(new pcl::search::KdTree<PointType>());
-    ne.setSearchMethod(tree);
-    pcl::PointCloud<pcl::Normal>::Ptr cloud_normals(new pcl::PointCloud<pcl::Normal>);
-    // ne.setRadiusSearch(0.8);
-    ne.setKSearch(100);
-    ne.compute(*cloud_normals);
-    // normalize normals
-    for (size_t i = 0; i < numPoints; ++i) {
-        float norm = sqrt(cloud_normals->points[i].normal_x * cloud_normals->points[i].normal_x +
-                           cloud_normals->points[i].normal_y * cloud_normals->points[i].normal_y +
-                           cloud_normals->points[i].normal_z * cloud_normals->points[i].normal_z);
-        cloud_normals->points[i].normal_x /= norm;
-        cloud_normals->points[i].normal_y /= norm;
-        cloud_normals->points[i].normal_z /= norm;
-    }
+    ROS_INFO("Received Image message with size %d x %d", this->received_image_.cols, this->received_image_.rows);
+}
 
-    // copy normals to point cloud data
-    for (size_t i = 0; i < numPoints; ++i) {
-        this->received_cloud_->points[i].normal_x = cloud_normals->points[i].normal_x;
-        this->received_cloud_->points[i].normal_y = cloud_normals->points[i].normal_y;
-        this->received_cloud_->points[i].normal_z = cloud_normals->points[i].normal_z;
-    }
-    cudaCheck(cudaMemcpy(d_pointCloudData, this->received_cloud_->points.data(), dataSize, cudaMemcpyHostToDevice));
-
-    // free CPU memory
-    this->received_cloud_->clear();
-    this->received_cloud_.reset();
-
-    // allocate output memory
-    float3* d_positions = nullptr;
-    float3* d_normals = nullptr;
-    cudaCheck(cudaMalloc((void**)&d_positions, numPoints * sizeof(float3)));
-    cudaCheck(cudaMalloc((void**)&d_normals, numPoints * sizeof(float3)));
+void OdometrySubscriber::odometryCallback(const nav_msgs::OdometryConstPtr& msg)
+{
+    this->received_odometry_ = *msg;
+    odom_cnt++;
     
-    // call CUDA kernel
-    cuda_format::convertToFloat3(d_pointCloudData, d_positions, d_normals, numPoints, d_hashdata);
-    cudaCheck(cudaDeviceSynchronize());
+    ROS_INFO("Received Odometry message with position %f, %f, %f, %f, %f, %f, %f", 
+    this->received_odometry_.pose.pose.position.x, 
+    this->received_odometry_.pose.pose.position.y, 
+    this->received_odometry_.pose.pose.position.z, 
+    this->received_odometry_.pose.pose.orientation.x, 
+    this->received_odometry_.pose.pose.orientation.y, 
+    this->received_odometry_.pose.pose.orientation.z, 
+    this->received_odometry_.pose.pose.orientation.w);
 
-    // free GPU memory
-    cudaCheck(cudaFree(d_pointCloudData));
-    cudaCheck(cudaFree(d_positions));
-    cudaCheck(cudaFree(d_normals));
+    state_pos << this->received_odometry_.pose.pose.position.x, this->received_odometry_.pose.pose.position.y, this->received_odometry_.pose.pose.position.z;
+    Eigen::Quaterniond q(this->received_odometry_.pose.pose.orientation.w, this->received_odometry_.pose.pose.orientation.x, this->received_odometry_.pose.pose.orientation.y, this->received_odometry_.pose.pose.orientation.z);
+    state_rot = q.toRotationMatrix();
+}
 
-    ROS_INFO("PointCloud received and uploaded to GPU successfully\n");
-    count_refresh++;
+void PathSubscriber::pathCallback(const nav_msgs::PathConstPtr& msg)
+{
+    this->received_path_ = *msg;
+    path_cnt++;
+    
+    ROS_INFO("Received Path message with %ld poses", this->received_path_.poses.size());
 }
 
 int main(int argc, char** argv)
 {
     ros::init(argc, argv, "pcd_receiver");
+    ros::NodeHandle nh;
+    readParameters(nh);
+
+    Lidar_offset_to_IMU<<VEC_FROM_ARRAY(extrinT);
+    Lidar_rot_to_IMU<<MAT_FROM_ARRAY(extrinR);
+    Camera_offset_to_Lidar<<VEC_FROM_ARRAY(cameraextrinT);
+    Camera_rot_to_Lidar<<MAT_FROM_ARRAY(cameraextrinR);
+
     PointCloudSubscriber pcd_receiver;
+    ImageSubscriber image_receiver;
+    OdometrySubscriber odometry_receiver;
+    PathSubscriber path_receiver;
 
     ROS_INFO("Running CUDA test...");
     cuda_test::run_cuda_test();
 
-    HashData hash;
-    hash.allocate(true);
-
-    cudaMalloc(&d_hashdata,sizeof(HashData));
-    cudaMemcpy(d_hashdata,&hash,sizeof(HashData),cudaMemcpyHostToDevice);
-
-    while (ros::ok() && count_refresh < MAX_POINT_CLOUD_ITER)
+    int store_cnt = 0;
+    while (ros::ok())
     {
         ros::spinOnce();
+        if (lidar_cnt == 1 && img_cnt == 1 && odom_cnt == 2 && path_cnt == 1)
+        {
+            ROS_INFO("All messages received\n");
+            // transform point cloud to depth image
+            PointCloudXYZRGB::Ptr cloud = pcd_receiver.getCloud();
+            if (cloud->size() > 0)
+            {
+                cv::Mat image = image_receiver.getImage();
+                nav_msgs::Odometry odometry = odometry_receiver.getOdometry();
+                nav_msgs::Path path = path_receiver.getPath();
+
+                pcl::io::savePCDFileASCII("/home/hmy/catkin_ws/src/pcd_receiver/PCD/pcd_files/frame_" + std::to_string(store_cnt) + ".pcd", *cloud);
+                ROS_INFO("Saved frame %d to frame_%d.pcd", store_cnt, store_cnt);
+                // transformPointCloudToDepthImage(cloud);
+                store_cnt++;
+            }
+            lidar_cnt = 0; img_cnt = 0; odom_cnt = 0; path_cnt = 0;
+        }
     }
-
-    // marching cubes
-    YAML::Node config = YAML::LoadFile("/home/hmy/ws_fast_lio/src/pcd_receiver/config/voxel_hashing.yaml");
-    
-    MarchingCubesParams mcParams = CUDAMarchingCubesHashSDF::parametersFromGlobalAppState(
-        config["marchingCubesMaxNumTriangles"].as<int>(), 
-        config["SDFMarchingCubeThreshFactor"].as<int>(), 
-        config["virtualVoxelSize"].as<float>(), 
-        config["hashNumBuckets"].as<int>(), 
-        config["SDFBlockSize"].as<int>(), 
-        config["hashBucketSize"].as<int>()
-    );
-    CUDAMarchingCubesHashSDF marchingCubes(mcParams);
-    marchingCubes.extractIsoSurface(hash, vec3f(0,0,0), vec3f(0,0,0), false);
-    marchingCubes.export_ply("/home/hmy/ws_fast_lio/src/pcd_receiver/PCD/mesh/output.ply");
-    ROS_INFO("Marching cubes completed");
-
-    float count = 0;
-    float* d_count;
-    float3* host_voxels = new float3[MAX_VOXELS];
-    float3* d_voxels;
-
-    cudaMalloc(&d_count,sizeof(float));
-    cudaMalloc(&d_voxels,MAX_VOXELS * sizeof(float3));
-    cudaMemcpy(d_count,&count,sizeof(float),cudaMemcpyHostToDevice);
-    cudaMemcpy(d_voxels,host_voxels,MAX_VOXELS * sizeof(float3),cudaMemcpyHostToDevice);
-    cudaMemcpy(host_voxels, d_voxels, MAX_VOXELS * sizeof(float3), cudaMemcpyDeviceToHost);
-    extract_pcd(d_hashdata,d_voxels,d_count);
-    cudaMemcpy(&count,d_count,sizeof(float),cudaMemcpyDeviceToHost);
-    cudaMemcpy(host_voxels, d_voxels, MAX_VOXELS * sizeof(float3), cudaMemcpyDeviceToHost);
-    pcl::PointCloud<pcl::PointXYZ> cloud;
-    for (int i = 0; i < count; ++i) {
-        pcl::PointXYZ point;
-        point.x = host_voxels[i].x;
-        point.y = host_voxels[i].y;
-        point.z = host_voxels[i].z;
-        cloud.push_back(point);
-    }
-
-    pcl::io::savePCDFileASCII("/home/hmy/ws_fast_lio/src/pcd_receiver/PCD/voxels.pcd", cloud);
-    ROS_INFO("Saved %d data points to voxels.pcd", cloud.size());
 
     return 0;
 }
