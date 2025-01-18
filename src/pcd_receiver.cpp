@@ -41,6 +41,10 @@ M3D state_cam_rot(Eye3d);
 V3D state_cam_pos(Zero3d);
 M3F state_cam_rot_f(Eye3f);
 
+M3D state_lidar_rot(Eye3d);
+V3D state_lidar_pos(Zero3d);
+M3F state_lidar_rot_f(Eye3f);
+
 int img_cnt = 0;
 int lidar_cnt = 0;
 int odom_cnt = 0;
@@ -90,6 +94,13 @@ void BodyToCamera(V3D& imu_trans, M3D& imu_rot)
     state_cam_pos = Camera_rot_to_Lidar * (Lidar_rot_to_IMU * imu_trans + Lidar_offset_to_IMU) + Camera_offset_to_Lidar;
     state_cam_rot = Camera_rot_to_Lidar * Lidar_rot_to_IMU * imu_rot;
     state_cam_rot_f = state_cam_rot.cast<float>();
+}
+
+void BodyToLidar(V3D& imu_trans, M3D& imu_rot)
+{
+    state_lidar_pos = Lidar_rot_to_IMU * imu_trans + Lidar_offset_to_IMU;
+    state_lidar_rot = Lidar_rot_to_IMU * imu_rot;
+    state_lidar_rot_f = state_lidar_rot.cast<float>();
 }
 
 cv::Mat processDepthImage(cv::Mat depth_image)
@@ -203,6 +214,8 @@ int main(int argc, char** argv)
     ROS_INFO("Running CUDA test...");
     cuda_test::run_cuda_test();
 
+    pcl::PointCloud<pcl::PointXYZRGB> whole_cloud;
+
     int store_cnt = 0;
     while (ros::ok())
     {
@@ -216,16 +229,47 @@ int main(int argc, char** argv)
             {
                 cv::Mat image = image_receiver.getImage();
                 nav_msgs::Odometry odometry = odometry_receiver.getOdometry();
+                BodyToLidar(state_pos, state_rot);
                 nav_msgs::Path path = path_receiver.getPath();
 
+                // for (size_t i = 0; i < cloud->size(); i++)
+                // {
+                //     pointWorldToLidar(&cloud->points[i], &cloud->points[i]);
+                // }
+                
+                // send world frame point cloud to visualizer
                 pcl::io::savePCDFileASCII("/home/hmy/catkin_ws/src/pcd_receiver/PCD/pcd_files/frame_" + std::to_string(store_cnt) + ".pcd", *cloud);
+                whole_cloud += *cloud;
                 ROS_INFO("Saved frame %d to frame_%d.pcd", store_cnt, store_cnt);
+
+                // send imu-based odometry to visualizer
+                std::ofstream odom_file("/home/hmy/catkin_ws/src/pcd_receiver/PCD/odometry_files/frame_" + std::to_string(store_cnt) + ".txt");
+                if (odom_file.is_open())
+                {
+                    odom_file << "Position:\n";
+                    odom_file << "x: " << odometry.pose.pose.position.x << "\n";
+                    odom_file << "y: " << odometry.pose.pose.position.y << "\n";
+                    odom_file << "z: " << odometry.pose.pose.position.z << "\n";
+                    odom_file << "Orientation:\n";
+                    odom_file << "w: " << odometry.pose.pose.orientation.w << "\n";
+                    odom_file << "x: " << odometry.pose.pose.orientation.x << "\n";
+                    odom_file << "y: " << odometry.pose.pose.orientation.y << "\n";
+                    odom_file << "z: " << odometry.pose.pose.orientation.z << "\n";
+                    odom_file.close();
+                    ROS_INFO("Saved odometry for frame %d to frame_%d.txt", store_cnt, store_cnt);
+                }
+                else
+                {
+                    ROS_ERROR("Unable to open file to save odometry for frame %d", store_cnt);
+                }
                 // transformPointCloudToDepthImage(cloud);
                 store_cnt++;
             }
             lidar_cnt = 0; img_cnt = 0; odom_cnt = 0; path_cnt = 0;
         }
     }
+
+    pcl::io::savePCDFileASCII("/home/hmy/catkin_ws/src/pcd_receiver/PCD/whole_cloud.pcd", whole_cloud);
 
     return 0;
 }
