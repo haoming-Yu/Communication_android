@@ -1,5 +1,7 @@
 #include "pcd_receiver.hpp"
 #include "cuda_test.hpp"
+#include <spdlog/spdlog.h>
+#include "scanner_server.h"
 
 // lidar to imu
 std::vector<double> extrinT(3, 0.0);
@@ -201,6 +203,23 @@ int main(int argc, char** argv)
     ros::NodeHandle nh;
     readParameters(nh);
 
+    spdlog::set_level(spdlog::level::debug);
+
+    ScannerServer app;
+    app.setupServer();
+    app.serve("tcp://0.0.0.0:8833");
+    app.startCamera.connect([&] {
+        // 雷达无所谓相机内参，随便发一个就行
+        app.sendModel(525, 525, 319.5, 239);
+
+        // TODO: 启动点云服务
+    });
+    app.stopCamera.connect([&] { 
+        // TODO: 停止点云服务
+    });
+    // 关机
+    app.shutdown.connect([&] { system("shutdown -P now"); });
+
     Lidar_offset_to_IMU<<VEC_FROM_ARRAY(extrinT);
     Lidar_rot_to_IMU<<MAT_FROM_ARRAY(extrinR);
     Camera_offset_to_Lidar<<VEC_FROM_ARRAY(cameraextrinT);
@@ -227,6 +246,9 @@ int main(int argc, char** argv)
             PointCloudXYZRGB::Ptr cloud = pcd_receiver.getCloud();
             if (cloud->size() > 0)
             {
+                // TODO: 调用 app.sendPointCloud 发送 pointcloud 和 pose
+                
+
                 cv::Mat image = image_receiver.getImage();
                 nav_msgs::Odometry odometry = odometry_receiver.getOdometry();
                 BodyToLidar(state_pos, state_rot);

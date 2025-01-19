@@ -45,7 +45,7 @@ find_path(MATPLOTLIB_CPP_INCLUDE_DIRS "matplotlibcpp.h")
 find_package(catkin REQUIRED COMPONENTS
   eigen_conversions
   geometry_msgs
-  livox_ros_driver
+  # livox_ros_driver
   message_generation
   nav_msgs
   pcl_ros
@@ -58,13 +58,19 @@ find_package(catkin REQUIRED COMPONENTS
 find_package(Eigen3 REQUIRED)
 
 # 明确指定PCL的搜索路径
-set(PCL_ROOT /usr/lib/x86_64-linux-gnu)  # 使用系统PCL库
+set(PCL_DIR /usr/lib/x86_64-linux-gnu/cmake/pcl)  # 使用系统PCL库
 set(PCL_INCLUDE_DIRS /usr/include/pcl-1.10)  # 根据你的PCL版本调整
 
 # 查找PCL包
 find_package(PCL 1.10 REQUIRED PATHS ${PCL_ROOT} NO_DEFAULT_PATH)
 
 find_package(OpenCV REQUIRED)
+
+# 第三方依赖
+set(NNG_TESTS OFF)
+add_subdirectory(third_party/nng-1.9.0)
+add_subdirectory(third_party/cereal-1.3.2)
+find_package(spdlog REQUIRED)
 
 # 添加PCL库的具体路径
 link_directories(${PCL_ROOT})
@@ -118,7 +124,10 @@ catkin_package(
   INCLUDE_DIRS
 )
 
-add_executable(pcd_receiver src/pcd_receiver.cpp)
+add_executable(pcd_receiver 
+    src/pcd_receiver.cpp
+    src/scanner_server.cpp
+)
 target_link_libraries(pcd_receiver 
     cuda_example
     ${catkin_LIBRARIES} 
@@ -126,6 +135,9 @@ target_link_libraries(pcd_receiver
     ${PYTHON_LIBRARIES} 
     ${OpenCV_LIBS}
     yaml-cpp
+    nng
+    cereal
+    spdlog::spdlog
 )
 target_include_directories(pcd_receiver PRIVATE ${PYTHON_INCLUDE_DIRS})
 
