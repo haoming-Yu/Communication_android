@@ -51,6 +51,7 @@ private:
 private:
     nng_socket sock_;
     nng_aio *recv_;
+    bool connected_;
 };
 
 #endif // __ScannerServer_H__

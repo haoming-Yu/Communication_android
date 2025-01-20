@@ -6,7 +6,7 @@
 #include <cereal/types/string.hpp>
 #include "serialize.h" // IWYU pragma: keep
 
-ScannerServer::ScannerServer() : sock_(NNG_SOCKET_INITIALIZER), recv_(nullptr) {}
+ScannerServer::ScannerServer() : sock_(NNG_SOCKET_INITIALIZER), recv_(nullptr), connected_(false) {}
 
 ScannerServer::~ScannerServer()
 {
@@ -88,6 +88,9 @@ void ScannerServer::sendPose(const Eigen::Matrix4f &pose)
 
 void ScannerServer::sendString(const std::string &v)
 {
+    if(!connected_) {
+        return;
+    }
     int code;
     if((code = nng_send(sock_, (void *)v.c_str(), v.size(), NNG_FLAG_NONBLOCK)) != 0) {
         spdlog::error("nng alloc msg failed {}", nng_strerror(code));
@@ -99,6 +102,7 @@ void ScannerServer::handle_connected(nng_pipe_s, nng_pipe_ev ev, void *user_data
     auto app = (ScannerServer *)user_data;
     spdlog::debug("client connected");
     nng_recv_aio(app->sock_, app->recv_);
+    app->connected_ = true;
 }
 
 void ScannerServer::handle_disconnected(nng_pipe_s, nng_pipe_ev ev, void *user_data)
@@ -106,6 +110,7 @@ void ScannerServer::handle_disconnected(nng_pipe_s, nng_pipe_ev ev, void *user_d
     auto app = (ScannerServer *)user_data;
     spdlog::debug("client disconnected");
     nng_aio_cancel(app->recv_);
+    app->connected_ = false;
     app->stopCamera();
 }
 
